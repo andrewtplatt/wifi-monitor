@@ -18,7 +18,7 @@ from pathlib import Path
 
 DB_PATH = Path(
     os.environ.get(
-        "WIFI_MONITOR_DB", str(Path.home() / ".local/share/wifi-monitor/uptime.db")
+        "WIFI_MONITOR_DB", str(Path(os.path.dirname(__file__)) / "monitor.db")
     )
 )
 SPEED_INTERVAL = dt.timedelta(minutes=30)
@@ -30,13 +30,13 @@ HTTPS_TARGETS = (
 )
 
 
-def now_utc():
-    return dt.datetime.now(dt.timezone.utc)
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
 
 
-def parse_time(s):
+def parse_time(s: str) -> dt.datetime:
     d = dt.datetime.fromisoformat(s)
-    return d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d
+    return d.replace(tzinfo=dt.UTC) if d.tzinfo is None else d
 
 
 def run_command(args, timeout=8):
@@ -48,12 +48,12 @@ def run_command(args, timeout=8):
         return None
 
 
-def unescape_nmcli(s):
+def unescape_nmcli(s: str) -> str:
     # nmcli -t escapes ':' and '\\' with a leading backslash.
     return re.sub(r"\\([:\\])", r"\1", s)
 
 
-def get_wifi():
+def get_wifi() -> tuple[str | None, str | None]:
     """Return (interface, SSID), or (None, None) when not associated."""
     status = run_command(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"])
     if not status or status.returncode != 0:
@@ -87,14 +87,12 @@ def get_wifi():
     return None, None
 
 
-def get_signal_score(iface):
+def get_signal_score(iface: str) -> int | None:
     """Return NetworkManager's 0-100 signal score, or None if unavailable.
 
     This uses the same active Wi-Fi interface as the connectivity check.
     It is a quality score, not a percentage of physical signal power.
     """
-    if not iface:
-        return None
     scan = run_command(
         [
             "nmcli",
@@ -120,7 +118,7 @@ def get_signal_score(iface):
     return None
 
 
-def get_gateway(iface):
+def get_gateway(iface: str) -> str | None:
     if not iface or not shutil.which("ip"):
         return None
     result = run_command(["ip", "-4", "route", "show", "default", "dev", iface])
@@ -130,7 +128,7 @@ def get_gateway(iface):
     return match.group(1) if match else None
 
 
-def ping(host, iface):
+def ping(host: str, iface: str) -> tuple[bool, float | None]:
     """Return (success, milliseconds or None), always using the Wi-Fi interface."""
     if not iface or not shutil.which("ping"):
         return False, None
@@ -143,10 +141,9 @@ def ping(host, iface):
     return True, float(match.group(1)) if match else None
 
 
-def https_probe(iface):
+def https_probe(iface: str) -> bool:
     """Return True on any bound HTTPS response, False if all fail, None if unavailable."""
-    if not iface or not shutil.which("curl"):
-        return None
+
     for url in HTTPS_TARGETS:
         result = run_command(
             [
@@ -176,16 +173,14 @@ def https_probe(iface):
     return False
 
 
-def check_connectivity(iface):
+def check_connectivity(iface: str) -> tuple[str, float | None, bool]:
     """Return (status, latency_ms, gateway_ok).
 
     status: 'up', 'down', or 'unknown'. No active interface => 'down' is
     recorded separately as a Wi-Fi disconnection in measurement status.
     """
-    if not iface:
-        return "unknown", None, None
     gateway = get_gateway(iface)
-    gateway_ok = ping(gateway, iface)[0] if gateway else None
+    gateway_ok = ping(gateway, iface)[0] if gateway else False
 
     latency = None
     icmp_ok = False
@@ -195,6 +190,7 @@ def check_connectivity(iface):
             icmp_ok = True
             if latency is None:
                 latency = ms
+                break
 
     if icmp_ok:
         return "up", latency, gateway_ok
@@ -206,10 +202,8 @@ def check_connectivity(iface):
     return ("up" if https_ok else "down"), None, gateway_ok
 
 
-def measure_speed(iface):
+def measure_speed(iface: str) -> float | None:
     """Download 2 MB; bind to Wi-Fi with curl to avoid Ethernet/VPN routing."""
-    if not iface or not shutil.which("curl"):
-        return None
     url = SPEED_URL + "&t=" + str(time.time_ns())
     start = time.monotonic()
     result = run_command(
@@ -310,8 +304,15 @@ def record(
 def monitor():
     timestamp = now_utc()
     iface, ssid = get_wifi()
+
     # Capture NetworkManager's 0-100 score at every associated Wi-Fi sample.
-    signal_score = get_signal_score(iface) if ssid is not None else None
+    if ssid is not None:
+        assert iface is not None
+        signal_score = get_signal_score(iface)
+    else:
+        signal_score = None
+
+    attempted, speed = False, None
     if not iface:
         status, latency, gateway_ok = "wifi_disconnected", None, None
     elif not ssid:
@@ -319,13 +320,11 @@ def monitor():
         status, latency, gateway_ok = "unknown", None, None
     else:
         status, latency, gateway_ok = check_connectivity(iface)
-
-    attempted, speed = False, None
-    if status == "up":
-        with sqlite3.connect(DB_PATH) as db:
-            due = speed_test_due(db, ssid, timestamp)
-        if due:
-            attempted, speed = True, measure_speed(iface)
+        if status == "up":
+            with sqlite3.connect(DB_PATH) as db:
+                due = speed_test_due(db, ssid, timestamp)
+            if due:
+                attempted, speed = True, measure_speed(iface)
 
     record(
         timestamp,
@@ -482,6 +481,8 @@ def main():
         parser.error("--days requires --outages and a positive number of days")
     if not shutil.which("nmcli"):
         raise RuntimeError("nmcli is required but was not found in PATH")
+    if not shutil.which("curl"):
+        raise RuntimeError("curl is required but was not found in PATH")
     initialize_database()
     if args.summary:
         show_summary()
