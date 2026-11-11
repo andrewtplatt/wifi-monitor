@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Sample Linux Wi-Fi connectivity each minute; speed-test every 30 minutes.
 
-Requires: Python 3, iproute2 (`ip`), iputils-ping (`ping`), NetworkManager
-(`nmcli`). `curl` enables HTTPS fallback when ICMP is filtered. No root
-privileges needed.
+Requires: Python 3, NetworkManager (`nmcli`), iproute2 (`ip`),
+iputils-ping (`ping`). `curl` enables HTTPS fallback when ICMP is filtered.
+No root privileges needed.
 """
 
 import argparse
@@ -31,12 +31,12 @@ HTTPS_TARGETS = (
 
 
 def now_utc():
-    return dt.datetime.now(dt.UTC)
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def parse_time(s):
     d = dt.datetime.fromisoformat(s)
-    return d.replace(tzinfo=dt.UTC) if d.tzinfo is None else d
+    return d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d
 
 
 def run_command(args, timeout=8):
@@ -56,36 +56,68 @@ def unescape_nmcli(s):
 def get_wifi():
     """Return (interface, SSID), or (None, None) when not associated."""
     status = run_command(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"])
-    if status and status.returncode == 0:
-        for line in status.stdout.splitlines():
-            parts = line.split(":", 2)
-            if len(parts) != 3:
-                continue
-            iface, typ, state = parts
-            if typ != "wifi" or not state.startswith("connected"):
-                continue
-            scan = run_command(
-                [
-                    "nmcli",
-                    "-t",
-                    "-f",
-                    "IN-USE,SSID",
-                    "device",
-                    "wifi",
-                    "list",
-                    "ifname",
-                    iface,
-                ]
-            )
-            if scan and scan.returncode == 0:
-                for row in scan.stdout.splitlines():
-                    if row.startswith("*:"):
-                        return iface, unescape_nmcli(row[2:]) or None
-            # An associated Wi-Fi interface with unknown SSID: do not
-            # guess a profile name or attribute it to the last SSID.
-            return iface, None
-
+    if not status or status.returncode != 0:
+        raise RuntimeError("nmcli could not query NetworkManager device status")
+    for line in status.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        iface, typ, state = parts
+        if typ != "wifi" or not state.startswith("connected"):
+            continue
+        scan = run_command(
+            [
+                "nmcli",
+                "-t",
+                "-f",
+                "IN-USE,SSID",
+                "device",
+                "wifi",
+                "list",
+                "ifname",
+                iface,
+            ]
+        )
+        if scan and scan.returncode == 0:
+            for row in scan.stdout.splitlines():
+                if row.startswith("*:"):
+                    return iface, unescape_nmcli(row[2:]) or None
+        # The interface is associated, but its SSID is unavailable.
+        return iface, None
     return None, None
+
+
+def get_signal_score(iface):
+    """Return NetworkManager's 0-100 signal score, or None if unavailable.
+
+    This uses the same active Wi-Fi interface as the connectivity check.
+    It is a quality score, not a percentage of physical signal power.
+    """
+    if not iface:
+        return None
+    scan = run_command(
+        [
+            "nmcli",
+            "-t",
+            "-f",
+            "IN-USE,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            iface,
+        ]
+    )
+    if not scan or scan.returncode != 0:
+        return None
+    for row in scan.stdout.splitlines():
+        if row.startswith("*:"):
+            try:
+                score = int(row[2:])
+            except ValueError:
+                return None
+            return score if 0 <= score <= 100 else None
+    return None
 
 
 def get_gateway(iface):
@@ -212,6 +244,7 @@ def measure_speed(iface):
 
 
 def initialize_database():
+    """Create a fresh database schema; no legacy migrations are needed."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as db:
         db.execute("""CREATE TABLE IF NOT EXISTS measurements (
@@ -225,27 +258,9 @@ def initialize_database():
             speed_test_attempted INTEGER NOT NULL DEFAULT 0,
             wifi_interface TEXT,
             connectivity_status TEXT,
-            gateway_reachable INTEGER
+            gateway_reachable INTEGER,
+            signal_score INTEGER CHECK (signal_score BETWEEN 0 AND 100)
         )""")
-        columns = {r[1] for r in db.execute("PRAGMA table_info(measurements)")}
-        for name, definition in (
-            ("speed_test_attempted", "INTEGER NOT NULL DEFAULT 0"),
-            ("wifi_interface", "TEXT"),
-            ("connectivity_status", "TEXT"),
-            ("gateway_reachable", "INTEGER"),
-        ):
-            if name not in columns:
-                db.execute(f"ALTER TABLE measurements ADD COLUMN {name} {definition}")
-        # Legacy rows: 'reachable=0, connected=0' means disconnected;
-        # otherwise, the old ping-only result is only a tentative signal.
-        db.execute("""UPDATE measurements
-            SET connectivity_status = CASE
-                WHEN connected = 0 THEN 'wifi_disconnected'
-                WHEN reachable = 1 THEN 'up'
-                ELSE 'unknown' END
-            WHERE connectivity_status IS NULL""")
-        db.execute("""UPDATE measurements SET speed_test_attempted=1
-            WHERE download_mbps IS NOT NULL AND speed_test_attempted=0""")
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_wifi_time ON measurements(timestamp, id)"
         )
@@ -264,7 +279,9 @@ def speed_test_due(db, ssid, timestamp):
     return row is None or timestamp - parse_time(row[0]) >= SPEED_INTERVAL
 
 
-def record(timestamp, iface, ssid, status, ping_ms, gateway_ok, mbps, attempted):
+def record(
+    timestamp, iface, ssid, status, ping_ms, gateway_ok, mbps, attempted, signal_score
+):
     connected = int(ssid is not None and iface is not None)
     reachable = int(status == "up")
     with sqlite3.connect(DB_PATH, timeout=15) as db:
@@ -272,8 +289,8 @@ def record(timestamp, iface, ssid, status, ping_ms, gateway_ok, mbps, attempted)
             """INSERT INTO measurements
             (timestamp, ssid, connected, reachable, ping_ms,
              download_mbps, speed_test_attempted, wifi_interface,
-             connectivity_status, gateway_reachable)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             connectivity_status, gateway_reachable, signal_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 timestamp.isoformat(timespec="seconds"),
                 ssid,
@@ -285,6 +302,7 @@ def record(timestamp, iface, ssid, status, ping_ms, gateway_ok, mbps, attempted)
                 iface,
                 status,
                 None if gateway_ok is None else int(gateway_ok),
+                signal_score,
             ),
         )
 
@@ -292,6 +310,8 @@ def record(timestamp, iface, ssid, status, ping_ms, gateway_ok, mbps, attempted)
 def monitor():
     timestamp = now_utc()
     iface, ssid = get_wifi()
+    # Capture NetworkManager's 0-100 score at every associated Wi-Fi sample.
+    signal_score = get_signal_score(iface) if ssid is not None else None
     if not iface:
         status, latency, gateway_ok = "wifi_disconnected", None, None
     elif not ssid:
@@ -307,11 +327,22 @@ def monitor():
         if due:
             attempted, speed = True, measure_speed(iface)
 
-    record(timestamp, iface, ssid, status, latency, gateway_ok, speed, attempted)
+    record(
+        timestamp,
+        iface,
+        ssid,
+        status,
+        latency,
+        gateway_ok,
+        speed,
+        attempted,
+        signal_score,
+    )
     print(
         f"{timestamp.isoformat(timespec='seconds')} SSID={ssid!r} "
         f"interface={iface!r} status={status} gateway={gateway_ok} "
-        f"ping_ms={latency} speed_mbps={speed} speed_test={attempted}"
+        f"ping_ms={latency} signal_score={signal_score} "
+        f"speed_mbps={speed} speed_test={attempted}"
     )
 
 
@@ -449,6 +480,8 @@ def main():
     args = parser.parse_args()
     if args.days is not None and (args.days <= 0 or args.outages is None):
         parser.error("--days requires --outages and a positive number of days")
+    if not shutil.which("nmcli"):
+        raise RuntimeError("nmcli is required but was not found in PATH")
     initialize_database()
     if args.summary:
         show_summary()
